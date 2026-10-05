@@ -17,6 +17,7 @@ Main/runs/detect/runs/ft5/
 !.gitignore
 !CLAUDE.md
 !README.md
+!INSTRUKTIONER.md
 !requirements.txt
 # the pipeline (pipeline_3d.py imports shared parts from pipeline.py)
 !Main/pipeline.py
