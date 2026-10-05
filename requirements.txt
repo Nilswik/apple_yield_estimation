@@ -1,0 +1,11 @@
+# Python 3.12. Versions pinned to the ones the reference results were made with.
+# For an NVIDIA GPU, install torch first from the CUDA index (see README), then this file.
+torch==2.6.0
+torchvision==0.21.0
+ultralytics==8.4.171
+opencv-python==5.0.0.93
+numpy==2.5.2
+pandas==3.0.6
+scipy==1.18.1
+matplotlib==3.11.2
+lap==0.5.13

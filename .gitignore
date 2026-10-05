@@ -1,0 +1,27 @@
+# Only what is needed to RUN the system goes in the repo. Everything else (data, notebooks, debug and
+# evaluation scripts, generated results) stays local. To add a file, put a "!path" line in the list below.
+# Note: gitignore has no end-of-line comments, so every comment sits on its own line.
+
+# ignore everything...
+*
+# ...but still look inside folders, so single files can be let back in
+!*/
+# do not even walk into these (big, never needed)
+.venv/
+Archive/
+__pycache__/
+Main/runs/detect/runs/ft3/
+Main/runs/detect/runs/ft5/
+
+# ---- needed to run
+!.gitignore
+!CLAUDE.md
+!README.md
+!requirements.txt
+# the pipeline (pipeline_3d.py imports shared parts from pipeline.py)
+!Main/pipeline.py
+!Main/pipeline_3d.py
+# fine-tuned apple detector the pipeline loads
+!Main/runs/detect/runs/apple_ft/weights/last.pt
+# size calibration, so new recordings can be processed without re-calibrating on the tree-1 recordings
+!Main/3d_annotated/calibration/calibration.json
