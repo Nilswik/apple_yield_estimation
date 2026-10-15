@@ -16,7 +16,8 @@ Main/runs/detect/runs/ft5/
 # ---- needed to run
 !.gitignore
 !CLAUDE.md
-!README.md
+!/README.md
+!Main/3d_annotated/README.md
 !INSTRUKTIONER.md
 !requirements.txt
 # the pipeline (pipeline_3d.py imports shared parts from pipeline.py)
@@ -24,5 +25,8 @@ Main/runs/detect/runs/ft5/
 !Main/pipeline_3d.py
 # fine-tuned apple detector the pipeline loads
 !Main/runs/detect/runs/apple_ft/weights/last.pt
+# OAK-D snapshots: script + run 2b detector (trained on Orbbec + OAK-D)
+!Main/oak_d_snapshots.py
+!Main/runs/detect/runs/apple_ft_run2b/weights/last.pt
 # size calibration, so new recordings can be processed without re-calibrating on the tree-1 recordings
 !Main/3d_annotated/calibration/calibration.json

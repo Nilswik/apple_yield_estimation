@@ -39,3 +39,14 @@ This writes `Main/3d_annotated/<recording>/` with `annotated_3d.mp4`, `audit_num
 | 1dceb275 | 43 | 5.5 kg |
 
 The repo contains the fine-tuned detector (`Main/runs/detect/runs/apple_ft/weights/last.pt`) and the size calibration (`Main/3d_annotated/calibration/calibration.json`), so nothing else is needed. Do not run `--calibrate` unless you want to redo the calibration; it overwrites `calibration.json`.
+
+## OAK-D snapshots (Luxonis)
+
+For single OAK-D captures: a folder with, per capture, `<name>_metadata.json`, the RGB image and the depth PNG (mm, aligned to RGB), as exported by the OAK-D. The folder can be anywhere (avoid letters like Ä in its path).
+
+```
+cd Main
+python oak_d_snapshots.py C:/path/to/the/oak-d/folder
+```
+
+This writes `OAK_D_RES/` in the repo root: one annotated image per capture (with its depth map), `overview.png`, `summary.csv` and `apples.csv`. It uses the run 2b detector (`Main/runs/detect/runs/apple_ft_run2b/weights/last.pt`), trained on both cameras. Counts are per capture; the captures overlap, so they must not be added up into a tree total.

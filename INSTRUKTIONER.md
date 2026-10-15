@@ -25,7 +25,7 @@ Lägg koden i en mapp **utan å, ä eller ö** i sökvägen, till exempel `C:\ap
 
 ```
 cd C:\
-git clone <LÄNK TILL REPOT> apple
+git clone https://github.com/Nilswik/-pple.git apple
 cd C:\apple
 ```
 
@@ -96,6 +96,24 @@ Det tar några minuter (längre utan grafikkort). När det är klart skrivs en s
 
 Färgerna i videon: grön = räknat äpple, cyan = äpple som mätts i mm, röd = för långt bort (bakgrund, räknas inte).
 
+## Steg 7 (valfritt): Kör egna OAK-D-bilder
+
+Har du bilder från OAK-D-kameran (en mapp med `_metadata.json`, färgbild och djupbild per bild, som kameran exporterar)? Lägg mappen på en plats **utan å, ä eller ö** i sökvägen, till exempel `C:\oakd`, och kör:
+
+```
+cd C:\apple\Main
+..\.venv\Scripts\python oak_d_snapshots.py C:/oakd
+```
+
+Resultaten hamnar i `C:\apple\OAK_D_RES`:
+- en bild per foto med äpplena markerade och djupbilden bredvid
+- **overview.png**: alla foton i en bild
+- **summary.csv**: antal äpplen och storlek per foto
+
+Färgerna: grön = tydligt synligt äpple, orange = delvis dolt, cyan = uppmätt i mm, röd = för långt bort.
+
+Obs: räkningen gäller per foto. Fotona överlappar, så siffrorna ska inte läggas ihop till ett träd.
+
 ---
 
 ## Om något går fel
@@ -108,5 +126,6 @@ Färgerna i videon: grön = räknat äpple, cyan = äpple som mätts i mm, röd 
 | Bilder kan inte läsas / `!_src.empty()` | Sökvägen innehåller å, ä eller ö. Flytta allt till `C:\apple`. |
 | `ModuleNotFoundError` | Steg 4 blev inte klart. Kör om det. |
 | Mycket långsamt | Normalt utan NVIDIA-kort. Låt det jobba klart. |
+| Steg 7 hittar inga foton | Mappen ska innehålla filer som slutar på `_metadata.json`. Kontrollera sökvägen. |
 
 **Kör aldrig** `pipeline_3d.py --calibrate`. Det skriver över kalibreringen och ändrar resultaten.

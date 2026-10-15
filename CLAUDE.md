@@ -9,7 +9,9 @@ Student proof of concept: count apples and estimate yield per tree from RGB-D vi
 - `Main/eval_models.py`, `Main/eval_curve.py`: score detectors against hand-marked dots.
 - `Main/annotations/*_points.csv` + `marked_screenshots/`: the user's hand-marked apples (3 frames), used as ground truth.
 - `Main/annotation_batch/images/`: frames with X-AnyLabeling `.json` labels. 7 are corrected and used for training; the other 8 are pre-labelled but not yet corrected. **`1dceb2_*` frames are tree 2**: don't train on them while Tree2 is used as a test.
-- `Main/runs/detect/runs/apple_ft/weights/last.pt`: the fine-tuned detector (7 tree-1 frames). `ft3`, `ft5` are the learning-curve runs.
+- `Main/runs/detect/runs/apple_ft/weights/last.pt`: the fine-tuned detector (7 tree-1 frames, "run 1"; still the default in `pipeline_3d.py`). `ft3`, `ft5` are the learning-curve runs.
+- `Main/runs/detect/runs/apple_ft_run2b/weights/last.pt`: **run 2b**, the better model for both cameras: run 1's 7 Orbbec frames (each twice) + 5 corrected OAK-D snapshots (`Main/dataset_run2b`). OAK-D test F1 0.73 vs 0.58-0.62 for run 1; Orbbec dot frames F1 0.84, same as run 1, but only at confidence 0.25 (run 1: 0.45). Settings: OAK-D imgsz 1280 conf 0.55; Orbbec imgsz 1920 conf 0.25. `apple_ft_run2` (no Orbbec weighting) lost on Orbbec. Details in `Main/run2/README.md`; comparison script `Main/run2/compare.py`; held-out OAK-D test boxes in `Main/run2/test` (never train on them).
+- `Main/oak_d_snapshots.py`: OAK-D single snapshots (rgb + aligned depth). Defaults to run 2b (imgsz 1280, conf 0.55); in the repo, documented in README/INSTRUKTIONER. `OAK_D_RES/` holds the older run 1 output, `Main/run2/results/` the run 2b output. No tree totals: the snapshots overlap.
 - `Main/results_finetuned/`, `Main/results/`: older 2D outputs, made **before the strip-sampling bug fix** (see below). Kept for history.
 - `Main/STAKEHOLDER_SUMMARY.md`: one-page summary already sent to the stakeholder (with the 2D videos). Its counts and kg are outdated.
 - `Main/Model_lab.ipynb`: early baselines (red-color mask, pretrained YOLO). `capture.py`: RealSense recorder (older, from before the Orbbec data).
