@@ -1,26 +1,40 @@
-"""3D apple yield pipeline: the 2D pipeline (pipeline.py) plus the depth data.
+"""Skördepipeline för äpplen med djupdata (RGB-D-video från en Orbbec Gemini 2).
 
-Depth is used for four things:
-  1. Distance limit: detections farther than MAX_DEPTH_MM (3.0 m) are background (dishes, buckets, rakes, the next
-     tree) and are not counted. Detections without a depth reading are kept.
-  2. Depth-aware counting: when the camera travels sideways, near apples cross the image faster than far ones.
-     Measured on these recordings: apple motion = 1 + beta x (tree distance / apple distance - 1), beta about 0.8.
-     Each apple's strip is scaled by its own distance, so near and far apples are each counted about once.
-     Measured: almost no double counts (0-1 per pass). Inside the hand-marked views the count matches the hand count
-     within 0-7%. (A +-2 frame memory, WINDOW, is available but off: it counted 16% more than people do.)
-  3. Size: apples that stay fully visible over several frames (confident, round, steady size, nothing in front of
-     them in depth) are measured in mm from their box size and distance.
-  4. Calibration: one hand-weighed reference apple (109 g, 7.0 x 6.5 x 6.0 cm, average size on tree 1) fixes the size
-     scale. The scale is fitted on the tree-1 recordings that are not used for testing (--calibrate) and then applied
-     to every recording. Yield = apple count x mean weight of that recording's fully visible apples.
+Steg:
+  1. Detektera äpplen i varje bildruta (fine-tuned YOLO) och ta bort dubbla rutor på samma äpple.
+  2. Avstånd till varje äpple från djupbilden. Äpplen längre bort än MAX_DEPTH_MM (3,0 m) är bakgrund (fat, hinkar,
+     krattor, nästa träd) och räknas inte. Detektioner utan djupvärde behålls.
+  3. Kamerarörelsen mellan bildrutor mäts med hjälp av äpplena själva (den förflyttning flest äppelpar är överens om).
+     När kameran åker i sidled rör sig nära äpplen snabbare över bilden än äpplen långt bort. Uppmätt på dessa
+     inspelningar: äpplets rörelse = 1 + beta x (trädets avstånd / äpplets avstånd - 1), beta ungefär 0,8.
+  4. Räkning med strip sampling: var K:e bildruta räknar bara äpplena i sin egen remsa av scenen, och varje äpples remsa
+     skalas med dess avstånd. Remsorna täcker scenen, så varje äpple räknas ungefär en gång (0-1 dubbelräkningar per
+     passage). Inom de handmarkerade vyerna stämmer antalet med handräkningen inom 0-7 %. Antalet är medelvärdet över
+     flera K och startbildrutor; spridningen ger det rimliga intervallet.
+  5. Storlek: äpplen som är helt synliga i flera bildrutor (hög confidence, runda, jämn storlek, inget framför dem i
+     djupbilden) mäts i mm från rutans storlek och avståndet.
+  6. Kalibrering: ett handvägt referensäpple (109 g, 7,0 x 6,5 x 6,0 cm, medelstort på träd 1) bestämmer
+     storleksskalan. Skalan anpassas på de träd 1-inspelningar som inte används för test (--calibrate) och används
+     sedan på alla inspelningar. Skörd = antal äpplen x medelvikten för inspelningens helt synliga äpplen.
 
-Usage (from the Main folder):
-    python pipeline_3d.py --calibrate      # once: fits the size scale -> 3d_annotated/calibration/
+Användning (från mappen Main):
+    python pipeline_3d.py --calibrate      # en gång: anpassar storleksskalan -> calibration/calibration.json
     python pipeline_3d.py ../Archive/test_images ../Archive/Tree2 ../Archive/1dceb275-6e92-4368-9df5-1526972df094
 
-Writes 3d_annotated/<recording>/: annotated_3d.mp4 (ends with the summary), final.png, measured_apples.png,
-apples_measured.csv, counts.csv, detections.csv and summary.json. Add --reuse to skip detection when
-detections.csv already exists (only the drawing and the numbers are redone).
+Skriver ../Results/pipeline_3d/<inspelning>/: annotated_3d.mp4 (slutar med sammanfattningen), audit_numbered.mp4, final.png,
+measured_apples.png, apples_measured.csv, audit_apples.csv, counts.csv, detections.csv och summary.json. Lägg till
+--reuse för att hoppa över detektionen när detections.csv redan finns (bara ritningen och siffrorna görs om).
+
+Namn som används genomgående:
+  detections   tabell med en rad per detekterad äppelruta: frame, conf, x1, y1, x2, y2, cx, cy, size (px), z_mm
+               (avstånd), z_source ("apple" = eget djup, "around" = omgivningen, "none"), occluded, diameter_raw_mm,
+               far (bortom MAX_DEPTH_MM) och m (rörelsefaktor)
+  shift        (n_frames, 2)-array: kamerans sammanlagda förflyttning i px; position i scenen = position i bilden + shift
+  spacing      K: var K:e bildruta är en utvald bildruta
+  offset       index för den första utvalda bildrutan
+  result       dict från analyse(): allt som är känt om en inspelning
+  summary      dict från summarize(): siffrorna som skrivs till summary.json
+  calibration  dict från calibration/calibration.json (storleksskala och dess intervall)
 """
 
 import argparse
@@ -28,52 +42,49 @@ import json
 from pathlib import Path
 
 import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 
-import pipeline as P2  # shared 2D parts: duplicate-box suppression, camera-motion vote, depth reprojection
+import visualize
+from visualize import num
 
-WEIGHTS = "runs/detect/runs/apple_ft/weights/last.pt"
+WEIGHTS = "models/apple_run1.pt"  # run 1: fine-tuned YOLO11m på 7 bildrutor från träd 1 (Orbbec)
+APPLE_CLASS = 47     # "apple" bland COCO-klasserna; de fine-tunade modellerna behåller numret
 IMGSZ = 1920
-CONF_LOW = 0.2       # detections used to follow an apple between frames
-CONF_KEEP = 0.45     # detections that count (fine-tuned model)
-MAX_DEPTH_MM = 3000  # farther than this is background
-DEPTH_READ_MM = 10000  # depth beyond this is not trusted at all
-COUNT_ERROR = 0.10   # per-frame count error on the held-out marked frames (7% with the distance limit), rounded up
-SPACINGS = (3, 5, 8)  # every K-th frame; 4 start frames each
-WINDOW = 0            # frames before/after a sampled frame that also report its apples (0 = off). 2 rescued apples the
-                      # detector blinked on, but inside the hand-marked views it counted 16% more than the hand count
-                      # (it adds half-hidden apples people do not count), while one frame matched within 0-7%.
-WINDOW_MIN_FRAMES = 2  # an apple counts when seen in at least this many of those frames
-FPS = 15
-HOLD_SECONDS = 5
-OUT = Path("3d_annotated")
+CONF_LOW = 0.2       # detektioner som används för att följa ett äpple mellan bildrutor
+CONF_KEEP = 0.45     # detektioner som räknas (fine-tuned modell)
+NESTED_IOMIN = 0.5   # en ruta som har mer än denna andel av sin yta inuti en starkare ruta är en dubblett på samma äpple
+MAX_DEPTH_MM = 3000  # längre bort än så är bakgrund
+DEPTH_READ_MM = 10000  # djup bortom detta litar vi inte alls på
+MAX_SHIFT = 100      # px: största kamerarörelse mellan två bildrutor
+SHIFT_BIN = 4        # px: upplösning i röstningen om kamerarörelsen
+COUNT_ERROR = 0.10   # räknefel per bildruta på de handmarkerade testbildrutorna (7 % med avståndsgränsen), avrundat uppåt
+SPACINGS = (3, 5, 8)  # var K:e bildruta; 4 startbildrutor vardera
+OUT = Path("../Results/pipeline_3d")  # resultat (videor, bilder, tabeller)
+CALIBRATION_DIR = Path("calibration")  # storlekskalibreringen som pipelinen läser
 ARCHIVE = Path("../Archive")
 
-# Reference apple, hand measured on tree 1: 7.0 x 6.5 x 6.0 cm, 109 g, "average size of the apples on the tree"
+# Referensäpple, handmätt på träd 1: 7,0 x 6,5 x 6,0 cm, 109 g, "medelstorlek för äpplena på trädet"
 REF_DIAMETER_MM = 65.0
 REF_MASS_G = 109.0
-DENSITY = REF_MASS_G / ((np.pi / 6) * (REF_DIAMETER_MM / 10) ** 3)  # g/cm3 for a sphere of the mean diameter
-# Tree-1 recordings used to fit the size scale. test_images (tree 1) and Tree2 + 1dceb275 (both tree 2) are tests.
+DENSITY = REF_MASS_G / ((np.pi / 6) * (REF_DIAMETER_MM / 10) ** 3)  # g/cm3 för en sfär med medeldiametern
+# Träd 1-inspelningar som storleksskalan anpassas på. test_images (träd 1) och Tree2 + 1dceb275 (båda träd 2) är test.
 CALIBRATION_RECORDINGS = ["1aa65ece-d32f-4254-bcd3-80b26d2db7b9", "341f04ca-054a-4e52-ae96-139378821ea8",
                           "5fa2faba-e6d8-410e-803e-a52e8a0d9089", "849d204a-348a-4494-b9c9-a9e0d3903359",
                           "Annotation_tetst", "d4d77803-a829-42b5-8eb2-a4c86f31e99a"]
-TREE_OF = {"test_images": "tree 1", "Tree2": "tree 2", "1dceb275-6e92-4368-9df5-1526972df094": "tree 2"}
+TREE_OF = {"test_images": "träd 1", "Tree2": "träd 2", "1dceb275-6e92-4368-9df5-1526972df094": "träd 2"}
 
-# "Fully visible": followed over several frames, confident, round, steady size, nothing in front of it in depth
-VIS_WINDOW = 6           # frames before and after the counted frame
+# "Helt synligt": följt över flera bildrutor, hög confidence, runt, jämn storlek, inget framför det i djupbilden
+VIS_WINDOW = 6           # bildrutor före och efter den räknade bildrutan
 VIS_MIN_VIEWS = 7
 VIS_MIN_CONF = 0.6
 VIS_MAX_ASPECT = 1.2
-VIS_MAX_SIZE_CV = 0.10   # box size may vary at most 10% between views (a leaf moving over it changes the size)
+VIS_MAX_SIZE_CV = 0.10   # rutans storlek får variera högst 10 % mellan vyerna (ett löv som rör sig framför ändrar storleken)
 VIS_MIN_SIZE_PX = 16
 VIS_MIN_DEPTH_VIEWS = 4
-VIS_MAX_DEPTH_SPREAD = 0.06  # distance may vary at most 6% between views
-OCCLUDER_MM = 60         # depth pixels this much in front of the apple's surface belong to something in front of it
+VIS_MAX_DEPTH_SPREAD = 0.06  # avståndet får variera högst 6 % mellan vyerna
+OCCLUDER_MM = 60         # djuppixlar så här mycket framför äpplets yta tillhör något som skymmer det
 VIS_MAX_OCCLUDED = 0.15
 
 MARKED_FRAMES = [("test_images", 15, "annotations/test_images_000015_points.csv"),
@@ -81,65 +92,158 @@ MARKED_FRAMES = [("test_images", 15, "annotations/test_images_000015_points.csv"
                  ("1aa65ece-d32f-4254-bcd3-80b26d2db7b9", 23, "annotations/1aa65e_000023_points.csv")]
 
 
-# ---------------------------------------------------------------- depth
+def sphere_mass_g(diameter_mm):
+    """Vikten för ett äpple med denna diameter, som en sfär med referensäpplets densitet."""
+    return DENSITY * (np.pi / 6) * (diameter_mm / 10) ** 3
+
+
+# ---------------------------------------------------------------- djup
+
+def align_depth_to_color(depth_mm, meta, z_min=300, z_max=DEPTH_READ_MM):
+    """Reprojection av en Orbbec-djupbild till färgbilden (djupkameran och färgkameran sitter inte på samma ställe).
+
+    Parametrar:
+        depth_mm: rå djupbild, uint16 i mm, i djupkamerans pixlar.
+        meta: inspelningens meta.json (intrinsics för djup och färg, extrinsics djup -> färg).
+        z_min, z_max: djupvärden utanför detta intervall (mm) ignoreras.
+
+    Returnerar:
+        float32-array lika stor som färgbilden, avstånd i mm; NaN där ingen djuppunkt hamnade.
+    """
+    depth_intr, color_intr = meta["depth_intrinsics"], meta["color_intrinsics"]
+    extrinsics = meta["depth_to_color_extrinsics"]
+    rotation = np.array(extrinsics["rotation"], float).reshape(3, 3)
+    translation = np.array(extrinsics["translation_mm"], float)
+    v, u = np.nonzero((depth_mm > z_min) & (depth_mm < z_max))
+    z = depth_mm[v, u].astype(np.float32)
+    points = np.stack([(u - depth_intr["cx"]) * z / depth_intr["fx"],
+                       (v - depth_intr["cy"]) * z / depth_intr["fy"], z], axis=1) @ rotation.T + translation
+    u_color = np.round(points[:, 0] * color_intr["fx"] / points[:, 2] + color_intr["cx"]).astype(int)
+    v_color = np.round(points[:, 1] * color_intr["fy"] / points[:, 2] + color_intr["cy"]).astype(int)
+    inside = (u_color >= 0) & (u_color < color_intr["width"]) & (v_color >= 0) & (v_color < color_intr["height"])
+    out = np.full((color_intr["height"], color_intr["width"]), np.inf, np.float32)
+    np.minimum.at(out, (v_color[inside], u_color[inside]), points[inside, 2])  # närmaste yta vinner
+    out[np.isinf(out)] = np.nan
+    return out
+
 
 def fill_holes(depth, k=5):
-    """Close the small gaps the reprojection leaves (a grid of empty pixels): each gap gets the nearest surface."""
+    """Fyll de små luckor som reprojection lämnar efter sig (ett rutnät av tomma pixlar): varje lucka får närmaste yta.
+
+    Parametrar:
+        depth: avståndsbild i mm, NaN där okänt.
+        k: grannskapets storlek i px.
+
+    Returnerar:
+        en kopia med luckorna fyllda (stora hål förblir NaN).
+    """
     valid = np.isfinite(depth)
     big = np.where(valid, depth, 1e9).astype(np.float32)
-    nearest = cv2.erode(big, np.ones((k, k), np.uint8))
+    nearest = cv2.erode(big, np.ones((k, k), np.uint8))  # minimumfilter = närmaste yta
     out = depth.copy()
     gap = ~valid & (nearest < 1e8)
     out[gap] = nearest[gap]
     return out
 
 
-def load_depth(rec, frame_path, meta):
-    raw = cv2.imread(str(rec / "depth" / (frame_path.stem + ".png")), cv2.IMREAD_UNCHANGED)
-    aligned = P2.align_depth_to_color(raw, meta, z_max=DEPTH_READ_MM)
+def load_depth(recording, frame_path, meta):
+    """Djupet för en färgbild, efter reprojection på färgbilden.
+
+    Returnerar:
+        aligned (med luckor, används för kontrollen av skymda äpplen) och filled (luckor fyllda, används för avstånd).
+    """
+    raw = cv2.imread(str(recording / "depth" / (frame_path.stem + ".png")), cv2.IMREAD_UNCHANGED)
+    aligned = align_depth_to_color(raw, meta)
     return aligned, fill_holes(aligned)
 
 
 def box_depth(aligned, filled, x1, y1, x2, y2):
-    """Distance to the apple (median over the box centre), how much of the apple is covered by something in front of
-    it, and a fallback distance from the surroundings when the apple itself has no depth."""
+    """Avståndet till äpplet i en ruta, och hur mycket av det som skyms av något närmare.
+
+    Parametrar:
+        aligned, filled: djupbilder från load_depth.
+        x1, y1, x2, y2: äpplets ruta i px.
+
+    Returnerar:
+        z_mm: medianavstånd över rutans mitt, eller från omgivningen när äpplet självt saknar djup.
+        source: "apple" (eget djup), "around" (omgivningen) eller "none".
+        occluded: andel av äpplets pixlar med något mer än OCCLUDER_MM framför (NaN om source inte är "apple").
+    """
     w, h = x2 - x1, y2 - y1
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     core = filled[int(cy - h / 4): int(cy + h / 4) + 1, int(cx - w / 4): int(cx + w / 4) + 1]
-    zc = core[np.isfinite(core)]
-    if len(zc) >= 4:
-        z = float(np.median(zc))
+    core_z = core[np.isfinite(core)]
+    if len(core_z) >= 4:
+        z = float(np.median(core_z))
         yy, xx = np.mgrid[int(y1): int(y2) + 1, int(x1): int(x2) + 1]
-        inside = ((xx - cx) / max(w / 2, 1)) ** 2 + ((yy - cy) / max(h / 2, 1)) ** 2 <= 1
+        in_ellipse = ((xx - cx) / max(w / 2, 1)) ** 2 + ((yy - cy) / max(h / 2, 1)) ** 2 <= 1
         box = aligned[int(y1): int(y2) + 1, int(x1): int(x2) + 1]
-        zb = box[inside[: box.shape[0], : box.shape[1]] & np.isfinite(box)]
-        occluded = float((zb < z - OCCLUDER_MM).mean()) if len(zb) >= 4 else np.nan
+        box_z = box[in_ellipse[: box.shape[0], : box.shape[1]] & np.isfinite(box)]
+        occluded = float((box_z < z - OCCLUDER_MM).mean()) if len(box_z) >= 4 else np.nan
         return z, "apple", occluded
     around = filled[max(0, int(cy - 1.5 * h)): int(cy + 1.5 * h) + 1, max(0, int(cx - 1.5 * w)): int(cx + 1.5 * w) + 1]
-    za = around[np.isfinite(around)]
-    return (float(np.median(za)), "around", np.nan) if len(za) >= 4 else (np.nan, "none", np.nan)
+    around_z = around[np.isfinite(around)]
+    return (float(np.median(around_z)), "around", np.nan) if len(around_z) >= 4 else (np.nan, "none", np.nan)
 
 
-# ---------------------------------------------------------------- detection and motion
+# ---------------------------------------------------------------- detektion och rörelse
 
-def detect(rec, meta, model, frames):
-    """Run the detector on every frame. One row per detection, with distance, occlusion and raw size in mm."""
+def suppress_nested(boxes, scores, iomin=NESTED_IOMIN):
+    """Ta bort en ruta när största delen av den ligger inuti en ruta med högre confidence. Detektorn lägger ofta 2-5 rutor på samma
+    äpple, och vanlig NMS behåller dem när storlekarna skiljer sig. Riktiga grannäpplen överlappar mycket mindre än så.
+
+    Parametrar:
+        boxes: (n, 4)-array med x1, y1, x2, y2.
+        scores: (n,) detektorns confidence-värden.
+        iomin: överlapp (snittyta / den mindre rutans yta) över vilket en ruta räknas som dubblett.
+
+    Returnerar:
+        Index för rutorna som behålls, högst confidence först.
+    """
+    keep = []
+    for i in np.argsort(-scores):
+        x1, y1, x2, y2 = boxes[i]
+        area = max((x2 - x1) * (y2 - y1), 1e-6)
+        duplicate = False
+        for j in keep:
+            a1, b1, a2, b2 = boxes[j]
+            inter = max(0, min(x2, a2) - max(x1, a1)) * max(0, min(y2, b2) - max(y1, b1))
+            if inter / min(area, max((a2 - a1) * (b2 - b1), 1e-6)) > iomin:
+                duplicate = True
+                break
+        if not duplicate:
+            keep.append(i)
+    return np.array(keep, dtype=int)
+
+
+def detect(recording, meta, model, frame_paths):
+    """Kör detektorn på varje bildruta.
+
+    Parametrar:
+        recording: inspelningsmappen (har color/ och depth/).
+        meta: inspelningens meta.json.
+        model: YOLO-modell.
+        frame_paths: färgbilderna, i ordning.
+
+    Returnerar:
+        detections-tabell: en rad per äppelruta, med avstånd, skymd andel och rå storlek i mm.
+    """
     fx = meta["color_intrinsics"]["fx"]
     rows = []
-    for i, f in enumerate(frames):
-        color = cv2.imread(str(f))
+    for frame, frame_path in enumerate(frame_paths):
+        color = cv2.imread(str(frame_path))
         H, W = color.shape[:2]
-        aligned, filled = load_depth(rec, f, meta)
-        res = model.predict(color, classes=[47], conf=CONF_LOW, imgsz=IMGSZ, verbose=False)[0]
-        boxes, scores = res.boxes.xyxy.cpu().numpy(), res.boxes.conf.cpu().numpy()
-        keep = P2.suppress_nested(boxes, scores)
-        for (x1, y1, x2, y2), c in zip(boxes[keep], scores[keep]):
+        aligned, filled = load_depth(recording, frame_path, meta)
+        result = model.predict(color, classes=[APPLE_CLASS], conf=CONF_LOW, imgsz=IMGSZ, verbose=False)[0]
+        boxes, scores = result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()
+        keep = suppress_nested(boxes, scores)
+        for (x1, y1, x2, y2), conf in zip(boxes[keep], scores[keep]):
             w, h = x2 - x1, y2 - y1
             size = (w + h) / 2
             z, source, occluded = box_depth(aligned, filled, x1, y1, x2, y2)
-            # front surface distance + radius = centre distance:  D = size * (z + D/2) / fx
+            # avstånd till framsidan + radien = avstånd till mitten:  D = size * (z + D/2) / fx
             diameter = size * z / (fx - size / 2) if source == "apple" else np.nan
-            rows.append(dict(frame=i, conf=float(c), x1=x1, y1=y1, x2=x2, y2=y2, cx=(x1 + x2) / 2, cy=(y1 + y2) / 2,
+            rows.append(dict(frame=frame, conf=float(conf), x1=x1, y1=y1, x2=x2, y2=y2, cx=(x1 + x2) / 2, cy=(y1 + y2) / 2,
                              size=size, aspect=max(w, h) / max(min(w, h), 1),
                              at_edge=bool(x1 < 5 or y1 < 5 or x2 > W - 5 or y2 > H - 5),
                              z_mm=z, z_source=source, occluded=occluded, diameter_raw_mm=diameter,
@@ -147,539 +251,502 @@ def detect(rec, meta, model, frames):
     return pd.DataFrame(rows)
 
 
-def depth_motion(det, shift):
-    """How much of the camera motion is sideways travel (near apples move faster) rather than turning.
-    Fits  apple motion / dominant motion = 1 + beta x (z_ref / z - 1);  beta 1 = pure travel, 0 = pure turning."""
-    good = det[(det.conf >= CONF_KEEP) & (det.z_source == "apple") & ~det.far]
+def vote_shift(prev_points, next_points, prior):
+    """Kamerarörelsen mellan två bildrutor: den förflyttning som flest äppelpar är överens om.
+
+    Parametrar:
+        prev_points, next_points: (n, 2) äpplenas mittpunkter i de två bildrutorna.
+        prior: förra bildrutans förflyttning (rörelsen är jämn), eller None.
+
+    Returnerar:
+        (dx, dy) förflyttning i bilden, eller None om ingen tydlig vinnare finns.
+    """
+    if len(prev_points) < 4 or len(next_points) < 4:
+        return None
+    moves = (next_points[None, :, :] - prev_points[:, None, :]).reshape(-1, 2)  # alla par av äpplen
+    if prior is not None:
+        moves = moves[np.hypot(*(moves - prior).T) < 40]  # rörelsen är jämn: håll dig nära förra uppskattningen
+    moves = moves[np.hypot(*moves.T) < MAX_SHIFT]
+    if len(moves) < 5:
+        return None
+    edges = np.arange(-MAX_SHIFT, MAX_SHIFT + SHIFT_BIN, SHIFT_BIN)
+    votes, _, _ = np.histogram2d(moves[:, 0], moves[:, 1], bins=[edges, edges])
+    votes = cv2.GaussianBlur(votes.astype(np.float32), (0, 0), 1.0) * (2 * np.pi)
+    ix, iy = np.unravel_index(np.argmax(votes), votes.shape)
+    if votes[ix, iy] < 5:
+        return None
+    peak = np.array([edges[ix] + SHIFT_BIN / 2, edges[iy] + SHIFT_BIN / 2])
+    return moves[np.hypot(*(moves - peak).T) < 2 * SHIFT_BIN].mean(axis=0)
+
+
+def camera_positions(detections, n_frames):
+    """Kamerans sammanlagda förflyttning per bildruta (position i scenen = position i bilden + shift).
+
+    Parametrar:
+        detections: detections-tabell (bara detektioner med minst CONF_KEEP röstar).
+        n_frames: antal bildrutor i inspelningen.
+
+    Returnerar:
+        shift: (n_frames, 2)-array i px.
+        lost: antal bildrutepar utan tydlig röstning (då återanvänds förra rörelsen).
+    """
+    points = {f: g[g.conf >= CONF_KEEP][["cx", "cy"]].to_numpy() for f, g in detections.groupby("frame")}
+    empty = np.zeros((0, 2))
+    shift, last, lost = [np.zeros(2)], None, 0
+    for frame in range(1, n_frames):
+        move = vote_shift(points.get(frame - 1, empty), points.get(frame, empty), last)
+        if move is None:
+            move = last if last is not None else np.zeros(2)  # ingen tydlig röstning: fortsätt åt samma håll
+            lost += 1
+        else:
+            last = move
+        shift.append(shift[-1] - move)
+    return np.array(shift), lost
+
+
+def depth_motion(detections, shift):
+    """Hur stor del av kamerarörelsen som är förflyttning i sidled (nära äpplen rör sig snabbare) och inte vridning.
+    Anpassar  äpplets rörelse / dominerande rörelse = 1 + beta x (z_ref / z - 1);  beta 1 = bara sidled, 0 = bara vridning.
+
+    Parametrar:
+        detections: detections-tabell.
+        shift: kamerans förflyttning per bildruta (camera_positions).
+
+    Returnerar:
+        z_ref: medianavstånd till äpplena i mm (trädets avstånd).
+        beta: anpassad andel sidled, begränsad till 0-1,2 (0 om färre än 30 matchade äpplen).
+        n_moves: antal äppelrörelser som anpassningen bygger på.
+    """
+    good = detections[(detections.conf >= CONF_KEEP) & (detections.z_source == "apple") & ~detections.far]
     z_ref = float(good.z_mm.median())
     by_frame = {f: g for f, g in good.groupby("frame")}
     xs, ys = [], []
-    for f in range(len(shift) - 1):
-        a, b = by_frame.get(f), by_frame.get(f + 1)
-        d = shift[f] - shift[f + 1]  # dominant image motion from f to f+1
-        if a is None or b is None or abs(d[0]) < 4:
+    for frame in range(len(shift) - 1):
+        now, after = by_frame.get(frame), by_frame.get(frame + 1)
+        move = shift[frame] - shift[frame + 1]  # dominerande rörelse i bilden från denna bildruta till nästa
+        if now is None or after is None or abs(move[0]) < 4:
             continue
-        bx, by = b.cx.to_numpy(), b.cy.to_numpy()
-        for r in a.itertuples():
-            dist = np.hypot(bx - (r.cx + d[0]), by - (r.cy + d[1]))
+        after_x, after_y = after.cx.to_numpy(), after.cy.to_numpy()
+        for apple in now.itertuples():
+            dist = np.hypot(after_x - (apple.cx + move[0]), after_y - (apple.cy + move[1]))
             j = int(dist.argmin())
-            if dist[j] < 0.6 * r.size:
-                xs.append(z_ref / r.z_mm - 1)
-                ys.append((bx[j] - r.cx) / d[0] - 1)
+            if dist[j] < 0.6 * apple.size:  # samma äpple i nästa bildruta
+                xs.append(z_ref / apple.z_mm - 1)
+                ys.append((after_x[j] - apple.cx) / move[0] - 1)
     xs, ys = np.array(xs), np.array(ys)
     ok = np.abs(ys) < 1.5
     if ok.sum() < 30 or np.sum(xs[ok] ** 2) == 0:
         return z_ref, 0.0, int(ok.sum())
-    beta = float(np.sum(xs[ok] * ys[ok]) / np.sum(xs[ok] ** 2))
+    beta = float(np.sum(xs[ok] * ys[ok]) / np.sum(xs[ok] ** 2))  # minstakvadratmetoden genom origo
     return z_ref, float(np.clip(beta, 0, 1.2)), int(ok.sum())
 
 
-def motion_factor(det, z_ref, beta):
-    """Per detection: how fast it crosses the image relative to the dominant motion (1 when its distance is unknown)."""
-    m = 1 + beta * (z_ref / det.z_mm - 1)
-    m = m.where((det.z_source == "apple") & ~det.far, 1.0)
+def motion_factor(detections, z_ref, beta):
+    """Per detektion: hur snabbt den rör sig över bilden jämfört med den dominerande rörelsen (1 när avståndet är okänt).
+
+    Returnerar:
+        Series m, i samma ordning som detections, begränsad till 0,4-2,5.
+    """
+    m = 1 + beta * (z_ref / detections.z_mm - 1)
+    m = m.where((detections.z_source == "apple") & ~detections.far, 1.0)
     return m.clip(0.4, 2.5).fillna(1.0)
 
 
-# ---------------------------------------------------------------- counting
+# ---------------------------------------------------------------- räkning
 
-def strip_count(det, shift, W, k, offset, use_depth=True, use_limit=True, window=0):
-    """Apples counted by every k-th frame: each apple counts only in the sampled frame whose centre is nearest to it in
-    the scene. With use_depth, 'nearest' is measured in the apple's own depth layer (its motion factor m).
+def strip_count(detections, shift, W, spacing, offset, use_depth=True, use_limit=True):
+    """Äpplen som räknas av var `spacing`:e bildruta (med start i `offset`): varje äpple räknas bara i den utvalda
+    bildruta vars mittpunkt ligger närmast det i scenen.
 
-    window = 0: only the sampled frame itself is looked at (one chance per apple).
-    window > 0 (short-term object permanence): the frames up to `window` before and after a sampled frame also report
-    the apples in its strip, moved to where they would be in the sampled frame. Detections that land on the same spot
-    are one apple, and an apple counts when it is seen in at least WINDOW_MIN_FRAMES of those frames. This rescues
-    apples the detector missed in the sampled frame and drops one-frame flicker. Returns one row per counted apple
-    (its view closest in time to the sampled frame)."""
-    frames = np.arange(offset, len(shift), k)
-    d = det[det.conf >= CONF_KEEP]
+    Parametrar:
+        detections: detections-tabell (behöver kolumnen m när use_depth).
+        shift: kamerans förflyttning per bildruta.
+        W: bildens bredd i px.
+        spacing, offset: vilka bildrutor som väljs ut.
+        use_depth: mät "närmast" med hänsyn till äpplets avstånd (skala dess rörelse med m).
+        use_limit: ta bort detektioner bortom MAX_DEPTH_MM.
+
+    Returnerar:
+        De räknade detektionerna (en rad per räknat äpple).
+    """
+    frames = np.arange(offset, len(shift), spacing)
+    confident = detections[detections.conf >= CONF_KEEP]
     if use_limit:
-        d = d[~d.far]
-    fr = d.frame.to_numpy().astype(int)
-    m = d.m.to_numpy() if use_depth else np.ones(len(d))
-    # which sampled frame's strip each detection belongs to (seen from its own frame)
-    dist = np.abs((d.cx.to_numpy() - W / 2)[:, None] + m[:, None] * (shift[fr, 0][:, None] - shift[frames, 0][None, :]))
-    strip = dist.argmin(axis=1)
-    if not window:
-        return d[frames[strip] == fr]
-    near = np.abs(fr - frames[strip]) <= window
-    d, m, fr, strip = d[near], m[near], fr[near], strip[near]
-    target = frames[strip]
-    px = d.cx.to_numpy() + m * (shift[fr, 0] - shift[target, 0])
-    py = d.cy.to_numpy() + m * (shift[fr, 1] - shift[target, 1])
-    size, conf = d["size"].to_numpy(), d.conf.to_numpy()
-    reps = []
-    for j in np.unique(strip):
-        idx = np.flatnonzero(strip == j)
-        idx = idx[np.argsort(-conf[idx])]
-        clusters = []  # [anchor index, set of frames, member indices]
-        for i in idx:
-            for c in clusters:
-                a = c[0]
-                if fr[i] not in c[1] and np.hypot(px[i] - px[a], py[i] - py[a]) < 0.6 * max(size[i], size[a]):
-                    c[1].add(fr[i])
-                    c[2].append(i)
-                    break
-            else:
-                clusters.append([i, {fr[i]}, [i]])
-        for _, seen, members in clusters:
-            if len(seen) >= WINDOW_MIN_FRAMES:
-                reps.append((min(members, key=lambda i: (abs(fr[i] - frames[j]), -conf[i])), frames[j] not in seen))
-    reps.sort()
-    # rescued = no confident detection in the sampled frame itself: the one-frame count would have missed it
-    return d.iloc[[i for i, _ in reps]].assign(rescued=[r for _, r in reps])
+        confident = confident[~confident.far]
+    own_frame = confident.frame.to_numpy().astype(int)
+    m = confident.m.to_numpy() if use_depth else np.ones(len(confident))
+    # avståndet från varje detektion till varje utvald bildrutas mittpunkt, sett från detektionens egen bildruta
+    dist = np.abs((confident.cx.to_numpy() - W / 2)[:, None]
+                  + m[:, None] * (shift[own_frame, 0][:, None] - shift[frames, 0][None, :]))
+    nearest = dist.argmin(axis=1)
+    return confident[frames[nearest] == own_frame]
 
 
-def count_variants(det, shift, W):
+def count_variants(detections, shift, W):
+    """Antal för varje metod (2d / 2d_limit / 3d), avstånd K och startbildruta.
+
+    Returnerar:
+        tabell med kolumnerna method, k, offset, count.
+    """
     rows = []
-    for name, use_depth, use_limit, window in (("2d", False, False, 0), ("2d_limit", False, True, 0),
-                                               ("3d_single_frame", True, True, 0), ("3d", True, True, WINDOW)):
-        for k in SPACINGS:
-            for off in range(min(k, 4)):
-                rows.append(dict(method=name, k=k, offset=off,
-                                 count=len(strip_count(det, shift, W, k, off, use_depth, use_limit, window))))
+    for method, use_depth, use_limit in (("2d", False, False), ("2d_limit", False, True), ("3d", True, True)):
+        for spacing in SPACINGS:
+            for offset in range(min(spacing, 4)):
+                count = len(strip_count(detections, shift, W, spacing, offset, use_depth, use_limit))
+                rows.append(dict(method=method, k=spacing, offset=offset, count=count))
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------- fully visible apples
+# ---------------------------------------------------------------- helt synliga äpplen
 
 def follow(start, by_frame, shift, n_frames):
-    """Views of one counted apple in the frames around it, following its own (depth-scaled) motion."""
+    """Vyerna av ett räknat äpple i bildrutorna runt det, genom att följa dess egen (djupskalade) rörelse.
+
+    Parametrar:
+        start: den räknade detektionen (en rad i detections-tabellen).
+        by_frame: {bildruta: detektioner i den bildrutan} att söka i.
+        shift: kamerans förflyttning per bildruta.
+        n_frames: antal bildrutor.
+
+    Returnerar:
+        tabell med äpplets vyer (start inräknad), upp till VIS_WINDOW bildrutor åt varje håll; slutar efter 2 missar.
+    """
     views = [start]
     for step in (1, -1):
-        cur, f, misses = start, int(start.frame), 0
-        while misses < 2 and abs(f + step - start.frame) <= VIS_WINDOW and 0 <= f + step < n_frames:
-            f += step
-            px = cur.cx + cur.m * (shift[int(cur.frame), 0] - shift[f, 0])
-            py = cur.cy + cur.m * (shift[int(cur.frame), 1] - shift[f, 1])
-            g = by_frame.get(f)
+        current, frame, misses = start, int(start.frame), 0
+        while misses < 2 and abs(frame + step - start.frame) <= VIS_WINDOW and 0 <= frame + step < n_frames:
+            frame += step
+            # där äpplet borde vara i denna bildruta
+            px = current.cx + current.m * (shift[int(current.frame), 0] - shift[frame, 0])
+            py = current.cy + current.m * (shift[int(current.frame), 1] - shift[frame, 1])
+            candidates = by_frame.get(frame)
             hit = None
-            if g is not None:
-                dist = np.hypot(g.cx.to_numpy() - px, g.cy.to_numpy() - py)
+            if candidates is not None:
+                dist = np.hypot(candidates.cx.to_numpy() - px, candidates.cy.to_numpy() - py)
                 j = int(dist.argmin())
-                cand = g.iloc[j]
-                if dist[j] < max(5.0, 0.5 * cur["size"]) and 0.7 < cand["size"] / cur["size"] < 1.4:
-                    hit = cand
+                closest = candidates.iloc[j]
+                if dist[j] < max(5.0, 0.5 * current["size"]) and 0.7 < closest["size"] / current["size"] < 1.4:
+                    hit = closest
             if hit is None:
                 misses += 1
             else:
                 views.append(hit)
-                cur, misses = hit, 0
+                current, misses = hit, 0
     return pd.DataFrame(views)
 
 
-def measure_visible(counted, det, shift):
-    """For every counted apple: follow it, judge whether it is fully visible, and measure it (raw mm, before calibration)."""
-    pool = det[(det.conf >= CONF_LOW) & ~det.far]
+def median_or_nan(values):
+    """Medianen, eller NaN om det inte finns några värden."""
+    return float(values.median()) if len(values) else np.nan
+
+
+def spread(values):
+    """Relativ spridning (standardavvikelse / medelvärde), eller NaN med färre än 2 värden."""
+    return float(values.std() / values.mean()) if len(values) > 1 else np.nan
+
+
+def is_fully_visible(apple):
+    """Är äpplet tillräckligt synligt för att mätas? Alla kontroller måste vara uppfyllda.
+    Ett saknat värde (NaN) gör kontrollen falsk, så då mäts äpplet inte (men det räknas fortfarande)."""
+    checks = [
+        apple["views"] >= VIS_MIN_VIEWS,                # sett i tillräckligt många bildrutor
+        apple["min_conf"] >= VIS_MIN_CONF,              # hög confidence i alla vyer
+        apple["max_aspect"] <= VIS_MAX_ASPECT,          # runt, inte avlångt
+        apple["size_cv"] <= VIS_MAX_SIZE_CV,            # jämn storlek (inget löv som rör sig framför)
+        not apple["at_edge"],                           # inte avskuret av bildkanten
+        apple["size_px"] >= VIS_MIN_SIZE_PX,            # inte för litet i bilden
+        apple["depth_views"] >= VIS_MIN_DEPTH_VIEWS,    # djup på själva äpplet i flera vyer
+        apple["depth_spread"] <= VIS_MAX_DEPTH_SPREAD,  # jämnt avstånd mellan vyerna
+        apple["occluded"] <= VIS_MAX_OCCLUDED,          # nästan inget framför äpplet
+    ]
+    return bool(all(checks))
+
+
+def measure_visible(counted, detections, shift):
+    """För varje räknat äpple: följ det, avgör om det är helt synligt och mät det (rå mm, före kalibrering).
+
+    Parametrar:
+        counted: de räknade detektionerna (strip_count).
+        detections: alla detektioner (följs ner till CONF_LOW).
+        shift: kamerans förflyttning per bildruta.
+
+    Returnerar:
+        apples: en rad per räknat äpple med statistik över vyerna och flaggan fully_visible.
+        views: alla följda vyer, med en kolumn `apple` som kopplar dem till apples.
+    """
+    pool = detections[(detections.conf >= CONF_LOW) & ~detections.far]
     by_frame = {f: g for f, g in pool.groupby("frame")}
     n_frames = len(shift)
     rows, all_views = [], []
-    for idx, start in counted.iterrows():
-        v = follow(start, by_frame, shift, n_frames)
-        zv = v[v.z_source == "apple"]
-        occ = v.occluded.dropna()
-        row = dict(apple=idx, frame=int(start.frame), views=len(v), min_conf=float(v.conf.min()),
-                   max_aspect=float(v.aspect.max()), size_px=float(v["size"].median()),
-                   size_cv=float(v["size"].std() / v["size"].mean()) if len(v) > 1 else np.nan,
-                   at_edge=bool(v.at_edge.any()), depth_views=len(zv),
-                   z_mm=float(zv.z_mm.median()) if len(zv) else np.nan,
-                   depth_spread=float(zv.z_mm.std() / zv.z_mm.mean()) if len(zv) > 1 else np.nan,
-                   occluded=float(occ.median()) if len(occ) else np.nan,
-                   diameter_raw_mm=float(zv.diameter_raw_mm.median()) if len(zv) else np.nan)
-        row["fully_visible"] = bool(
-            row["views"] >= VIS_MIN_VIEWS and row["min_conf"] >= VIS_MIN_CONF and row["max_aspect"] <= VIS_MAX_ASPECT
-            and row["size_cv"] <= VIS_MAX_SIZE_CV and not row["at_edge"] and row["size_px"] >= VIS_MIN_SIZE_PX
-            and row["depth_views"] >= VIS_MIN_DEPTH_VIEWS and row["depth_spread"] <= VIS_MAX_DEPTH_SPREAD
-            and row["occluded"] <= VIS_MAX_OCCLUDED)
+    for apple_id, start in counted.iterrows():
+        views = follow(start, by_frame, shift, n_frames)
+        with_depth = views[views.z_source == "apple"]  # vyerna där själva äpplet har ett djupvärde
+        # en rad per räknat äpple, sammanfattad över alla dess vyer
+        row = dict(
+            apple=apple_id,
+            frame=int(start.frame),                                     # bildrutan där äpplet räknades
+            views=len(views),                                           # antal bildrutor där det hittades
+            min_conf=float(views.conf.min()),                           # lägsta confidence
+            max_aspect=float(views.aspect.max()),                       # mest avlånga rutan (1 = rund)
+            size_px=float(views["size"].median()),                      # typisk storlek i px
+            size_cv=spread(views["size"]),                              # hur mycket storleken varierar
+            at_edge=bool(views.at_edge.any()),                          # rör bildkanten någon gång
+            depth_views=len(with_depth),                                # antal vyer med djup på äpplet
+            z_mm=median_or_nan(with_depth.z_mm),                        # avstånd till äpplet
+            depth_spread=spread(with_depth.z_mm),                       # hur mycket avståndet varierar
+            occluded=median_or_nan(views.occluded.dropna()),            # andel av äpplet som skyms
+            diameter_raw_mm=median_or_nan(with_depth.diameter_raw_mm),  # storlek i mm, före kalibreringen
+        )
+        row["fully_visible"] = is_fully_visible(row)
         rows.append(row)
-        all_views.append(v.assign(apple=idx))
+        all_views.append(views.assign(apple=apple_id))
     return pd.DataFrame(rows), pd.concat(all_views) if all_views else pd.DataFrame()
 
 
-# ---------------------------------------------------------------- one recording
+# ---------------------------------------------------------------- en inspelning
 
-def analyse(rec, model, out, reuse=False):
-    """Detection, camera motion, counts and fully visible apples for one recording (no calibration needed)."""
-    meta = json.loads((rec / "meta.json").read_text())
-    frames = sorted((rec / "color").glob("*.jpg"))
-    W = cv2.imread(str(frames[0])).shape[1]
+def analyse(recording, model, out, reuse=False):
+    """Detektion, kamerarörelse, antal och helt synliga äpplen för en inspelning (kräver ingen kalibrering).
+
+    Parametrar:
+        recording: inspelningsmappen.
+        model: YOLO-modell.
+        out: mapp för resultaten (detections.csv skrivs här).
+        reuse: läs detections.csv från en tidigare körning i stället för att detektera igen.
+
+    Returnerar:
+        result-dict: rec, meta, frames (sökvägar), W, det (detections), shift, lost, z_ref, beta, n_moves,
+        table (räknevarianter), counted, apples, views.
+    """
+    meta = json.loads((recording / "meta.json").read_text())
+    frame_paths = sorted((recording / "color").glob("*.jpg"))
+    W = cv2.imread(str(frame_paths[0])).shape[1]
     cache = out / "detections.csv"
     if reuse and cache.exists():
-        det = pd.read_csv(cache)
+        detections = pd.read_csv(cache)
     else:
-        det = detect(rec, meta, model, frames)
-    P2.CONF_KEEP = CONF_KEEP
-    shift, lost = P2.camera_positions(det[~det.far], len(frames))
-    z_ref, beta, n_moves = depth_motion(det, shift)
-    det["m"] = motion_factor(det, z_ref, beta)
+        detections = detect(recording, meta, model, frame_paths)
+    shift, lost = camera_positions(detections[~detections.far], len(frame_paths))
+    z_ref, beta, n_moves = depth_motion(detections, shift)
+    detections["m"] = motion_factor(detections, z_ref, beta)
     out.mkdir(parents=True, exist_ok=True)
-    det.to_csv(cache, index=False)
+    detections.to_csv(cache, index=False)
 
-    table = count_variants(det, shift, W)
-    t3 = table[table.method == "3d"]
-    typical = t3.iloc[(t3["count"] - t3["count"].mean()).abs().argmin()]  # the sampling variant shown in the video
-    counted = strip_count(det, shift, W, int(typical.k), int(typical.offset), window=WINDOW)
-    apples, views = measure_visible(counted, det, shift)
-    return dict(rec=rec, meta=meta, frames=frames, W=W, det=det, shift=shift, lost=lost, z_ref=z_ref, beta=beta,
-                n_moves=n_moves, table=table, counted=counted, apples=apples, views=views)
-
-
-def crop_sheet(r, apples, label, path, cols=8, tile=120):
-    """One tile per measured apple, from its most confident view."""
-    tiles = []
-    for a in apples.itertuples():
-        v = r["views"][(r["views"].apple == a.apple) & (r["views"].z_source == "apple")]
-        if not len(v):
-            continue
-        best = v.loc[v.conf.idxmax()]
-        img = cv2.imread(str(r["frames"][int(best.frame)]))
-        half = int(max(24, 1.4 * best["size"]))
-        pad = cv2.copyMakeBorder(img, half, half, half, half, cv2.BORDER_REFLECT)
-        cx, cy = int(best.cx) + half, int(best.cy) + half
-        t = cv2.resize(pad[cy - half: cy + half, cx - half: cx + half], (tile, tile), interpolation=cv2.INTER_CUBIC)
-        s = tile / (2 * half)
-        cv2.rectangle(t, (int(tile / 2 - best["size"] / 2 * s), int(tile / 2 - best["size"] / 2 * s)),
-                      (int(tile / 2 + best["size"] / 2 * s), int(tile / 2 + best["size"] / 2 * s)), (255, 255, 0), 1)
-        P2.put_text(t, label(a), (3, tile - 6), 0.4)
-        tiles.append(t)
-    if not tiles:
-        return
-    while len(tiles) % cols:
-        tiles.append(np.zeros_like(tiles[0]))
-    cv2.imwrite(str(path), np.vstack([np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)]))
+    table = count_variants(detections, shift, W)
+    table_3d = table[table.method == "3d"]
+    typical = table_3d.iloc[(table_3d["count"] - table_3d["count"].mean()).abs().argmin()]  # varianten som visas i videon
+    counted = strip_count(detections, shift, W, int(typical.k), int(typical.offset))
+    apples, views = measure_visible(counted, detections, shift)
+    return dict(rec=recording, meta=meta, frames=frame_paths, W=W, det=detections, shift=shift, lost=lost,
+                z_ref=z_ref, beta=beta, n_moves=n_moves, table=table, counted=counted, apples=apples, views=views)
 
 
-def rescued_sheet(r, path, cols=8, tile=110):
-    """Apples counted only thanks to the +-WINDOW frame memory (the detector missed them in the sampled frame)."""
-    tiles = []
-    for _, b in r["counted"][r["counted"].rescued].iterrows():
-        img = cv2.imread(str(r["frames"][int(b.frame)]))
-        half = int(max(24, 1.6 * b["size"]))
-        pad = cv2.copyMakeBorder(img, half, half, half, half, cv2.BORDER_REFLECT)
-        cx, cy = int(b.cx) + half, int(b.cy) + half
-        t = cv2.resize(pad[cy - half: cy + half, cx - half: cx + half], (tile, tile), interpolation=cv2.INTER_CUBIC)
-        s = tile / (2 * half)
-        cv2.rectangle(t, (int(tile / 2 - b["size"] / 2 * s), int(tile / 2 - b["size"] / 2 * s)),
-                      (int(tile / 2 + b["size"] / 2 * s), int(tile / 2 + b["size"] / 2 * s)), (0, 255, 0), 1)
-        P2.put_text(t, f"f{int(b.frame)} c{b.conf:.2f}", (3, tile - 6), 0.38)
-        tiles.append(t)
-    if not tiles:
-        return
-    while len(tiles) % cols:
-        tiles.append(np.zeros_like(tiles[0]))
-    cv2.imwrite(str(path), np.vstack([np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)]))
-
-
-# ---------------------------------------------------------------- calibration
+# ---------------------------------------------------------------- kalibrering
 
 def calibrate(model, reuse=False):
+    """Anpassa storleksskalan på träd 1-inspelningarna för kalibrering. Skriver calibration.json och
+    fully_visible_apples.csv till CALIBRATION_DIR, och bilder per inspelning till OUT/calibration/.
+
+    skala = referensdiametern / medianen av de helt synliga äpplenas råa diameter, med ett bootstrap-intervall.
+
+    Returnerar:
+        calibration-dict (sparas också som calibration.json).
+    """
     out = OUT / "calibration"
     out.mkdir(parents=True, exist_ok=True)
-    measured, per_rec = [], []
+    CALIBRATION_DIR.mkdir(exist_ok=True)
+    measured, per_recording = [], []
     for name in CALIBRATION_RECORDINGS:
-        r = analyse(ARCHIVE / name, model, out / name, reuse)
-        v = r["apples"][r["apples"].fully_visible].assign(recording=name)
-        measured.append(v)
-        crop_sheet(r, v, lambda a: f"{a.diameter_raw_mm:.0f} mm {a.z_mm / 1000:.1f} m", out / name / "fully_visible_apples.png")
-        per_rec.append(dict(recording=name, counted=len(r["counted"]), fully_visible=len(v),
-                            median_raw_diameter_mm=float(v.diameter_raw_mm.median()) if len(v) else None))
-        print(f"  {name[:12]:12s} counted {len(r['counted']):3d}  fully visible {len(v):3d}  "
-              f"median raw diameter {v.diameter_raw_mm.median():.1f} mm  beta {r['beta']:.2f}")
-    m = pd.concat(measured, ignore_index=True)
-    d = m.diameter_raw_mm.to_numpy()
-    scale = REF_DIAMETER_MM / float(np.median(d))
+        result = analyse(ARCHIVE / name, model, out / name, reuse)
+        visible = result["apples"][result["apples"].fully_visible].assign(recording=name)
+        measured.append(visible)
+        visualize.crop_sheet(result, visible, lambda a: f"{a.diameter_raw_mm:.0f} mm {num(a.z_mm / 1000)} m", out / name / "fully_visible_apples.png")
+        per_recording.append(dict(recording=name, counted=len(result["counted"]), fully_visible=len(visible),
+                                  median_raw_diameter_mm=float(visible.diameter_raw_mm.median()) if len(visible) else None))
+        print(f"  {name[:12]:12s} räknade {len(result['counted']):3d}  helt synliga {len(visible):3d}  "
+              f"median rå diameter {num(visible.diameter_raw_mm.median())} mm  beta {num(result['beta'], 2)}")
+    all_measured = pd.concat(measured, ignore_index=True)
+    diameters = all_measured.diameter_raw_mm.to_numpy()
+    scale = REF_DIAMETER_MM / float(np.median(diameters))
     rng = np.random.default_rng(0)
-    boot = REF_DIAMETER_MM / np.array([np.median(rng.choice(d, len(d))) for _ in range(2000)])
-    cal = dict(scale=scale, scale_low=float(np.percentile(boot, 5)), scale_high=float(np.percentile(boot, 95)),
-               scale_bootstrap=boot.round(5).tolist(), apples=len(d), median_raw_diameter_mm=float(np.median(d)),
-               reference=dict(diameter_mm=REF_DIAMETER_MM, mass_g=REF_MASS_G, axes_cm=[7.0, 6.5, 6.0],
-                              note="hand-weighed apple, described as average size on tree 1"),
-               density_g_cm3=DENSITY, per_recording=per_rec, recordings=CALIBRATION_RECORDINGS,
-               note="scale = reference diameter / median measured diameter of the fully visible tree-1 apples. "
-                    "The same physical apples appear in several recordings, so the bootstrap range is optimistic.")
-    (out / "calibration.json").write_text(json.dumps(cal, indent=2))
-    m.to_csv(out / "fully_visible_apples.csv", index=False)
-    depth_check_plot(m, scale, out / "depth_check.png")
-    print(f"Size scale {scale:.3f} (90% {cal['scale_low']:.3f}-{cal['scale_high']:.3f}) from {len(d)} fully visible "
-          f"tree-1 apples; median measured {np.median(d):.1f} mm -> reference {REF_DIAMETER_MM:.0f} mm")
-    return cal
+    boot = REF_DIAMETER_MM / np.array([np.median(rng.choice(diameters, len(diameters))) for _ in range(2000)])
+    calibration = dict(
+        scale=scale, scale_low=float(np.percentile(boot, 5)), scale_high=float(np.percentile(boot, 95)),
+        scale_bootstrap=boot.round(5).tolist(), apples=len(diameters), median_raw_diameter_mm=float(np.median(diameters)),
+        reference=dict(diameter_mm=REF_DIAMETER_MM, mass_g=REF_MASS_G, axes_cm=[7.0, 6.5, 6.0],
+                       note="handvägt äpple, beskrivet som medelstort på träd 1"),
+        density_g_cm3=DENSITY, per_recording=per_recording, recordings=CALIBRATION_RECORDINGS,
+        note="skala = referensdiameter / medianen av uppmätt diameter för de helt synliga träd 1-äpplena. "
+             "Samma fysiska äpplen syns i flera inspelningar, så bootstrap-intervallet är optimistiskt.")
+    (CALIBRATION_DIR / "calibration.json").write_text(json.dumps(calibration, indent=2))
+    all_measured.to_csv(CALIBRATION_DIR / "fully_visible_apples.csv", index=False)
+    visualize.depth_check_plot(all_measured, scale, out / "depth_check.png", REF_DIAMETER_MM)
+    print(f"Storleksskala {num(scale, 3)} (90 % {num(calibration['scale_low'], 3)}-{num(calibration['scale_high'], 3)}) från "
+          f"{len(diameters)} helt synliga träd 1-äpplen; uppmätt median {num(np.median(diameters))} mm -> referens {REF_DIAMETER_MM:.0f} mm")
+    return calibration
 
 
-def depth_check_plot(m, scale, path):
-    """Apple size in pixels shrinks with distance; in mm (pixels x distance) it should not."""
-    z = m.z_mm.to_numpy() / 1000
-    surface, ink, ink2, grid, series = "#fcfcfb", "#0b0b0b", "#52514e", "#e8e7e3", "#2a78d6"
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4.2), facecolor=surface)
-    for a in ax:
-        a.set_facecolor(surface)
-        a.spines[["top", "right"]].set_visible(False)
-        a.spines[["left", "bottom"]].set_color(grid)
-        a.grid(axis="y", color=grid, linewidth=0.8)
-        a.set_axisbelow(True)
-        a.tick_params(colors=ink2, length=0)
-        a.set_xlabel("distance to apple (m)", color=ink2)
-    ax[0].scatter(z, m.size_px, s=30, color=series, edgecolor=surface, linewidth=1.2)
-    ax[0].set_ylabel("apple size in the image (px)", color=ink2)
-    ax[0].set_ylim(0, float(m.size_px.max()) * 1.15)
-    ax[0].set_title("In pixels: far apples look smaller", loc="left", color=ink, fontsize=11)
-    dmm = m.diameter_raw_mm * scale
-    ax[1].axhline(REF_DIAMETER_MM, color=ink2, linewidth=1)
-    ax[1].scatter(z, dmm, s=30, color=series, edgecolor=surface, linewidth=1.2, zorder=3)
-    ax[1].text(1.01, REF_DIAMETER_MM, "reference\napple\n65 mm", color=ink2, fontsize=9, va="center",
-               transform=ax[1].get_yaxis_transform())
-    ax[1].set_ylabel("apple diameter from depth (mm)", color=ink2)
-    ax[1].set_ylim(0, max(100, float(dmm.max()) + 10))
-    ax[1].set_title("In mm, using depth: size no longer depends on distance", loc="left", color=ink, fontsize=11)
-    fig.suptitle(f"Fully visible tree-1 apples used for the calibration (n = {len(m)})", x=0.01, ha="left", color=ink, fontsize=12)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130, facecolor=surface)
-    plt.close(fig)
+# ---------------------------------------------------------------- resultat för en testinspelning
 
+def summarize(result, calibration):
+    """Antal, vikt och skörd (med rimliga intervall) för en inspelning.
 
-# ---------------------------------------------------------------- results for a test recording
+    Parametrar:
+        result: från analyse().
+        calibration: storlekskalibreringen.
 
-def summarize(r, cal):
-    table, apples = r["table"], r["apples"]
-    t = {k: g["count"] for k, g in table.groupby("method")}
-    n = int(round(t["3d"].mean()))
-    count_low = int(round(t["3d"].min() * (1 - COUNT_ERROR)))
-    count_high = int(round(t["3d"].max() * (1 + COUNT_ERROR)))
+    Returnerar:
+        summary-dict, och de helt synliga äpplena med kalibrerad diameter_mm och mass_g.
+    """
+    table, apples = result["table"], result["apples"]
+    counts = {method: g["count"] for method, g in table.groupby("method")}
+    n = int(round(counts["3d"].mean()))
+    count_low = int(round(counts["3d"].min() * (1 - COUNT_ERROR)))
+    count_high = int(round(counts["3d"].max() * (1 + COUNT_ERROR)))
 
-    k = cal["scale"]
-    vis = apples[apples.fully_visible].copy()
-    vis["diameter_mm"] = vis.diameter_raw_mm * k
-    vis["mass_g"] = DENSITY * (np.pi / 6) * (vis.diameter_mm / 10) ** 3
-    if len(vis) >= 5:
-        masses, source = vis.mass_g.to_numpy(), f"measured with depth on {len(vis)} fully visible apples"
-    else:  # too few clean apples in this recording: fall back on the calibration apples (tree 1)
-        cal_m = pd.read_csv(OUT / "calibration" / "fully_visible_apples.csv")
-        masses = (DENSITY * (np.pi / 6) * (cal_m.diameter_raw_mm * k / 10) ** 3).to_numpy()
-        source = f"only {len(vis)} fully visible apples here; tree-1 calibration apples used"
+    scale = calibration["scale"]
+    visible = apples[apples.fully_visible].copy()
+    visible["diameter_mm"] = visible.diameter_raw_mm * scale
+    visible["mass_g"] = sphere_mass_g(visible.diameter_mm)
+    if len(visible) >= 5:
+        masses, source = visible.mass_g.to_numpy(), f"mätt med djup på {len(visible)} helt synliga äpplen"
+    else:  # för få rena äpplen i denna inspelning: använd kalibreringsäpplena (träd 1)
+        calibration_apples = pd.read_csv(CALIBRATION_DIR / "fully_visible_apples.csv")
+        masses = sphere_mass_g(calibration_apples.diameter_raw_mm * scale).to_numpy()
+        source = f"bara {len(visible)} helt synliga äpplen här; kalibreringsäpplena från träd 1 används"
+    # viktintervall: bootstrap, dra äpplena och storleksskalan med återläggning
     rng = np.random.default_rng(1)
-    kb = np.array(cal["scale_bootstrap"])
-    boot = np.array([rng.choice(masses, len(masses)).mean() * (rng.choice(kb) / k) ** 3 for _ in range(4000)])
+    scale_boot = np.array(calibration["scale_bootstrap"])
+    boot = np.array([rng.choice(masses, len(masses)).mean() * (rng.choice(scale_boot) / scale) ** 3 for _ in range(4000)])
     mean_g = float(masses.mean())
     g_low, g_high = (float(x) for x in np.percentile(boot, [5, 95]))
 
-    det = r["det"]
-    conf_det = det[det.conf >= CONF_KEEP]
+    confident = result["det"][result["det"].conf >= CONF_KEEP]
+    name = result["rec"].name
     summary = dict(
-        recording=r["rec"].name, tree=TREE_OF.get(r["rec"].name, "?"), frames=len(r["frames"]),
+        # vilken inspelning
+        recording=name, tree=TREE_OF.get(name, "?"), frames=len(result["frames"]),
+        # antalet (medel av de 12 räknevarianterna) och dess rimliga intervall
         apples_counted=n, count_low=count_low, count_high=count_high,
-        count_2d_no_limit=float(t["2d"].mean()), count_2d_with_limit=float(t["2d_limit"].mean()),
-        count_3d_single_frame=float(t["3d_single_frame"].mean()), count_3d=float(t["3d"].mean()),
-        background_removed=float(t["2d"].mean() - t["2d_limit"].mean()),
-        detections_beyond_limit=int(conf_det.far.sum()), detections_without_depth=int((conf_det.z_source == "none").sum()),
-        max_depth_m=MAX_DEPTH_MM / 1000, tree_distance_m=r["z_ref"] / 1000, sideways_travel_share_beta=r["beta"],
-        fully_visible_apples=int(len(vis)), median_diameter_mm=float(vis.diameter_mm.median()) if len(vis) else None,
+        # samma räkning utan djup, med bara avståndsgränsen, och med djup
+        count_2d_no_limit=float(counts["2d"].mean()), count_2d_with_limit=float(counts["2d_limit"].mean()),
+        count_3d=float(counts["3d"].mean()),
+        background_removed=float(counts["2d"].mean() - counts["2d_limit"].mean()),
+        # kontroller av djupet
+        detections_beyond_limit=int(confident.far.sum()), detections_without_depth=int((confident.z_source == "none").sum()),
+        max_depth_m=MAX_DEPTH_MM / 1000, tree_distance_m=result["z_ref"] / 1000, sideways_travel_share_beta=result["beta"],
+        camera_pan_px=float(abs(result["shift"][-1, 0] - result["shift"][0, 0])),
+        # äpplenas vikt
+        fully_visible_apples=int(len(visible)), median_diameter_mm=float(visible.diameter_mm.median()) if len(visible) else None,
         mean_weight_g=mean_g, weight_low_g=g_low, weight_high_g=g_high, weight_source=source,
+        # skörd = antal x medelvikt
         estimate_kg=n * mean_g / 1000, kg_low=count_low * g_low / 1000, kg_high=count_high * g_high / 1000,
-        size_scale=k, size_scale_range=[cal["scale_low"], cal["scale_high"]],
-        camera_pan_px=float(abs(r["shift"][-1, 0] - r["shift"][0, 0])),
-        note=f"plausible range, not a statistical interval: count = lowest/highest of {len(t['3d'])} strip-sampling variants "
-             f"+/-{COUNT_ERROR:.0%} counting error; weight = 90% bootstrap over the fully visible apples and the size scale. "
-             "Size scale from one reference apple (109 g) assumed to be average for tree 1.",
+        # kalibreringen som användes
+        size_scale=scale, size_scale_range=[calibration["scale_low"], calibration["scale_high"]],
+        note=f"rimligt intervall, inte ett statistiskt konfidensintervall: antal = lägsta/högsta av {len(counts['3d'])} "
+             f"varianter av strip sampling +/-{COUNT_ERROR:.0%} räknefel; vikt = 90 % bootstrap över de helt synliga äpplena "
+             "och storleksskalan. Storleksskalan bygger på ett referensäpple (109 g) som antas vara medelstort för träd 1.",
     )
-    return summary, vis
-
-
-def summary_panel(img, s):
-    H, W = img.shape[:2]
-    out = (img * 0.3).astype(np.uint8)
-    x0, y0, x1, y1 = W // 2 - 450, H // 2 - 235, W // 2 + 450, H // 2 + 235
-    cv2.rectangle(out, (x0, y0), (x1, y1), (20, 20, 20), -1)
-    cv2.rectangle(out, (x0, y0), (x1, y1), (200, 200, 200), 2)
-    x, y = x0 + 40, y0 + 50
-    gray, light = (190, 190, 190), (150, 150, 150)
-    P2.put_text(out, f"{s['recording']}  ({s['tree']})  - 3D", (x, y), 0.75, gray)
-    P2.put_text(out, f"{s['apples_counted']} apples counted", (x, y + 65), 1.5, (120, 255, 120), 3)
-    P2.put_text(out, f"plausible range {s['count_low']} - {s['count_high']}  (average of 12 samplings)", (x, y + 100), 0.75, gray)
-    P2.put_text(out, f"Estimated yield: {s['estimate_kg']:.1f} kg", (x, y + 155), 1.25, (255, 255, 255), 2)
-    P2.put_text(out, f"plausible range {s['kg_low']:.1f} - {s['kg_high']:.1f} kg", (x, y + 190), 0.75, gray)
-    P2.put_text(out, f"mean apple {s['mean_weight_g']:.0f} g ({s['weight_low_g']:.0f}-{s['weight_high_g']:.0f}), "
-                     f"median {s['median_diameter_mm'] or 0:.0f} mm", (x, y + 235), 0.7, gray)
-    P2.put_text(out, s["weight_source"], (x, y + 265), 0.6, gray)
-    P2.put_text(out, "size scale from the 109 g reference apple (tree 1)", (x, y + 293), 0.6, gray)
-    P2.put_text(out, f"depth limit {s['max_depth_m']:.1f} m: {s['background_removed']:.0f} background objects not counted",
-                (x, y + 321), 0.6, gray)
-    P2.put_text(out, "Visible apples only, one side of the tree", (x, y + 360), 0.6, light)
-    return out
-
-
-def colorize_depth(filled, w, h):
-    z = cv2.resize(filled, (w, h), interpolation=cv2.INTER_NEAREST)
-    norm = np.clip((np.nan_to_num(z, nan=0) - 500) / (MAX_DEPTH_MM - 500), 0, 1)
-    img = cv2.applyColorMap((255 - norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)  # near = red, far = blue
-    img[np.isnan(z)] = (0, 0, 0)
-    img[np.nan_to_num(z, nan=0) > MAX_DEPTH_MM] = (80, 80, 80)
-    return img
-
-
-def render(r, s, vis, out):
-    frames, det, counted, views = r["frames"], r["det"], r["counted"], r["views"]
-    H, W = cv2.imread(str(frames[0])).shape[:2]
-    video = cv2.VideoWriter(str(out / "annotated_3d.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
-    shown = {f: g for f, g in det[det.conf >= CONF_KEEP].groupby("frame")}
-    counted_by = {f: g for f, g in counted.groupby("frame")}
-    vis_d = vis.set_index("apple").diameter_mm.to_dict()
-    measured_by = {f: g for f, g in views[views.apple.isin(vis_d)].groupby("frame")} if len(views) else {}
-    iw, ih = 320, 180
-    running, img = 0, None
-    for i, f in enumerate(frames):
-        img = cv2.imread(str(f))
-        _, filled = load_depth(r["rec"], f, r["meta"])
-        for b in shown.get(i, pd.DataFrame()).itertuples():
-            p1, p2 = (int(b.x1), int(b.y1)), (int(b.x2), int(b.y2))
-            if b.far:
-                cv2.rectangle(img, p1, p2, (0, 0, 255), 2)
-                P2.put_text(img, f"{b.z_mm / 1000:.1f} m", (p1[0], p1[1] - 4), 0.45, (120, 120, 255))
-            else:
-                cv2.rectangle(img, p1, p2, (170, 170, 170), 1)
-        c = counted_by.get(i, pd.DataFrame())
-        running += len(c)
-        for b in c.itertuples():
-            cv2.rectangle(img, (int(b.x1), int(b.y1)), (int(b.x2), int(b.y2)), (0, 255, 0), 2)
-        for b in measured_by.get(i, pd.DataFrame()).itertuples():
-            cv2.rectangle(img, (int(b.x1) - 2, int(b.y1) - 2), (int(b.x2) + 2, int(b.y2) + 2), (255, 255, 0), 2)
-            P2.put_text(img, f"{vis_d[b.apple]:.0f} mm", (int(b.x1), int(b.y1) - 6), 0.5, (255, 255, 0))
-        n_far = int(shown[i].far.sum()) if i in shown else 0
-        cv2.rectangle(img, (0, 0), (W, 34), (0, 0, 0), -1)
-        P2.put_text(img, f"frame {i}   counted so far (this sampling): {running}   depth limit {MAX_DEPTH_MM / 1000:.1f} m"
-                         f"   beyond limit in this frame: {n_far}", (10, 24), 0.6)
-        # legend
-        lx, ly = 10, H - 70
-        cv2.rectangle(img, (lx - 6, ly - 20), (lx + 330, H - 8), (0, 0, 0), -1)
-        for j, (col, txt) in enumerate((((0, 255, 0), "counted in this frame"), ((255, 255, 0), "fully visible: measured in mm"),
-                                        ((0, 0, 255), "too far (background): not counted"))):
-            cv2.rectangle(img, (lx, ly - 10 + 20 * j), (lx + 14, ly + 2 + 20 * j), col, 2)
-            P2.put_text(img, txt, (lx + 24, ly + 2 + 20 * j), 0.45)
-        # depth inset
-        inset = colorize_depth(filled, iw, ih)
-        x0, y0 = W - iw - 10, H - ih - 10
-        img[y0:y0 + ih, x0:x0 + iw] = inset
-        cv2.rectangle(img, (x0 - 1, y0 - 1), (x0 + iw, y0 + ih), (255, 255, 255), 1)
-        P2.put_text(img, f"depth: red 0.5 m - blue {MAX_DEPTH_MM / 1000:.0f} m, gray = too far", (x0, y0 - 6), 0.42)
-        video.write(img)
-    final = summary_panel(img, s)
-    cv2.imwrite(str(out / "final.png"), final)
-    for _ in range(HOLD_SECONDS * FPS):
-        video.write(final)
-    video.release()
-
-
-def render_audit(r, out, hold_seconds=2):
-    """Slow video for checking the count by eye: every counted apple gets a number on the frame where it is counted,
-    and that frame is held still. audit_apples.csv lists the numbers."""
-    frames, counted = r["frames"], r["counted"].sort_values(["frame", "cx"])
-    H, W = cv2.imread(str(frames[0])).shape[:2]
-    video = cv2.VideoWriter(str(out / "audit_numbered.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
-    numbers, n = [], 0
-    by = {f: g for f, g in counted.groupby("frame")}
-    for i, f in enumerate(frames):
-        img = cv2.imread(str(f))
-        g = by.get(i)
-        if g is None:
-            cv2.rectangle(img, (0, 0), (W, 34), (0, 0, 0), -1)
-            P2.put_text(img, f"frame {i}   apples counted so far: {n}", (10, 24), 0.65)
-            video.write(img)
-            continue
-        for _, b in g.iterrows():
-            n += 1
-            numbers.append(dict(number=n, frame=i, x=round(b.cx), y=round(b.cy), size_px=round(b["size"], 1),
-                                conf=round(b.conf, 2), distance_m=round(b.z_mm / 1000, 2) if np.isfinite(b.z_mm) else None))
-            cv2.rectangle(img, (int(b.x1), int(b.y1)), (int(b.x2), int(b.y2)), (0, 255, 0), 2)
-            P2.put_text(img, str(n), (int(b.x2) + 2, int(b.y1) + 10), 0.5, (0, 255, 0))
-        cv2.rectangle(img, (0, 0), (W, 34), (0, 0, 0), -1)
-        P2.put_text(img, f"frame {i}   apples counted so far: {n}   (new numbers in this frame: {n - len(g) + 1}-{n})", (10, 24), 0.65)
-        for _ in range(hold_seconds * FPS):
-            video.write(img)
-    video.release()
-    pd.DataFrame(numbers).to_csv(out / "audit_apples.csv", index=False)
+    return summary, visible
 
 
 def print_summary(s):
     bar = "=" * 64
     print(bar)
     print(f" {s['recording']}  ({s['tree']})")
-    print(f"   Apples counted : {s['apples_counted']}   (plausible range {s['count_low']} - {s['count_high']})")
-    print(f"      2D, no limit {s['count_2d_no_limit']:.0f} | 2D + 3 m limit {s['count_2d_with_limit']:.0f} | "
-          f"3D one frame {s['count_3d_single_frame']:.0f} | 3D +-{WINDOW} frames {s['count_3d']:.0f}")
-    print(f"   Mean apple     : {s['mean_weight_g']:.0f} g ({s['weight_low_g']:.0f}-{s['weight_high_g']:.0f}), "
+    print(f"   Räknade äpplen  : {s['apples_counted']}   (rimligt intervall {s['count_low']} - {s['count_high']})")
+    print(f"      2D utan gräns {s['count_2d_no_limit']:.0f} | 2D + 3 m-gräns {s['count_2d_with_limit']:.0f} | 3D {s['count_3d']:.0f}")
+    print(f"   Medelvikt       : {s['mean_weight_g']:.0f} g ({s['weight_low_g']:.0f}-{s['weight_high_g']:.0f}), "
           f"median {s['median_diameter_mm'] or 0:.0f} mm, {s['weight_source']}")
-    print(f"   Estimated yield: {s['estimate_kg']:.1f} kg   (plausible range {s['kg_low']:.1f} - {s['kg_high']:.1f} kg)")
-    print(f"   Tree at {s['tree_distance_m']:.2f} m, sideways travel share {s['sideways_travel_share_beta']:.2f}, "
-          f"{s['detections_beyond_limit']} detections beyond the limit")
+    print(f"   Uppskattad skörd: {num(s['estimate_kg'])} kg   (rimligt intervall {num(s['kg_low'])} - {num(s['kg_high'])} kg)")
+    print(f"   Trädet på {num(s['tree_distance_m'], 2)} m, andel sidledsrörelse {num(s['sideways_travel_share_beta'], 2)}, "
+          f"{s['detections_beyond_limit']} detektioner bortom gränsen")
     print(bar)
 
 
-def process(rec, model, cal, reuse=False):
-    out = OUT / rec.name
-    r = analyse(rec, model, out, reuse)
-    s, vis = summarize(r, cal)
-    r["table"].to_csv(out / "counts.csv", index=False)
-    r["apples"].merge(vis[["apple", "diameter_mm", "mass_g"]], on="apple", how="left").to_csv(out / "apples_measured.csv", index=False)
-    (out / "summary.json").write_text(json.dumps(s, indent=2))
-    crop_sheet(r, vis, lambda a: f"{a.diameter_mm:.0f} mm {a.mass_g:.0f} g", out / "measured_apples.png")
-    if WINDOW:
-        rescued_sheet(r, out / "rescued_apples.png")
-    render_audit(r, out)
-    render(r, s, vis, out)
-    return s
+def process(recording, model, calibration, reuse=False):
+    """Kör hela pipelinen på en inspelning och skriv resultaten till OUT/<inspelningens namn>/.
+
+    Returnerar:
+        summary-dict.
+    """
+    out = OUT / recording.name
+    result = analyse(recording, model, out, reuse)
+    summary, visible = summarize(result, calibration)
+    result["table"].to_csv(out / "counts.csv", index=False)
+    result["apples"].merge(visible[["apple", "diameter_mm", "mass_g"]], on="apple", how="left").to_csv(out / "apples_measured.csv", index=False)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    # bilder och videor (påverkar inga siffror)
+    visualize.crop_sheet(result, visible, lambda a: f"{a.diameter_mm:.0f} mm {a.mass_g:.0f} g", out / "measured_apples.png")
+    visualize.render_audit(result, out)
+    depth_frames = (load_depth(recording, frame_path, result["meta"])[1] for frame_path in result["frames"])
+    visualize.render(result, summary, visible, out, depth_frames, CONF_KEEP, MAX_DEPTH_MM)
+    return summary
 
 
-# ---------------------------------------------------------------- check on the hand-marked frames
+# ---------------------------------------------------------------- kontroll på de handmarkerade bildrutorna
 
 def evaluate_marked(model):
-    """Recall and precision on the hand-marked frames, with and without the depth limit."""
+    """Träffsäkerhet (recall och precision) på de handmarkerade bildrutorna, med och utan avståndsgränsen.
+
+    En markerad punkt räknas som hittad när den ligger inuti en detekterad ruta (8 px marginal); varje ruta och varje
+    punkt används en gång.
+
+    Returnerar:
+        tabell med en rad per bildruta och gränsinställning (sparas också som marked_frames_eval.csv).
+    """
     rows = []
-    for name, f, csv in MARKED_FRAMES:
-        rec = ARCHIVE / name
-        meta = json.loads((rec / "meta.json").read_text())
-        fp = rec / "color" / f"{f:06d}.jpg"
-        det = detect(rec, meta, model, [fp])
-        det = det[det.conf >= CONF_KEEP].reset_index(drop=True)
-        pts = pd.read_csv(csv)[["x", "y"]].to_numpy()
+    for name, frame, points_csv in MARKED_FRAMES:
+        recording = ARCHIVE / name
+        meta = json.loads((recording / "meta.json").read_text())
+        frame_path = recording / "color" / f"{frame:06d}.jpg"
+        detections = detect(recording, meta, model, [frame_path])
+        detections = detections[detections.conf >= CONF_KEEP].reset_index(drop=True)
+        points = pd.read_csv(points_csv)[["x", "y"]].to_numpy()
         for limit in (False, True):
-            d = det[~det.far] if limit else det
-            hit_b, hit_p = set(), set()
-            for i, b in d.iterrows():
-                inside = [j for j, (px, py) in enumerate(pts) if j not in hit_p and b.x1 - 8 <= px <= b.x2 + 8 and b.y1 - 8 <= py <= b.y2 + 8]
+            boxes = detections[~detections.far] if limit else detections
+            boxes_hit, points_hit = set(), set()
+            for i, box in boxes.iterrows():
+                inside = [j for j, (px, py) in enumerate(points)
+                          if j not in points_hit and box.x1 - 8 <= px <= box.x2 + 8 and box.y1 - 8 <= py <= box.y2 + 8]
                 if inside:
-                    j = min(inside, key=lambda j: (pts[j][0] - b.cx) ** 2 + (pts[j][1] - b.cy) ** 2)
-                    hit_b.add(i)
-                    hit_p.add(j)
-            rows.append(dict(frame=f"{name[:12]}:{f}", depth_limit=f"{MAX_DEPTH_MM / 1000:.1f} m" if limit else "none",
-                             marked=len(pts), detections=len(d), recall=len(hit_p) / len(pts),
-                             precision_lower_bound=len(hit_b) / max(len(d), 1), count_error=len(d) / len(pts) - 1))
-    df = pd.DataFrame(rows).round(3)
-    df.to_csv(OUT / "marked_frames_eval.csv", index=False)
-    return df
+                    j = min(inside, key=lambda j: (points[j][0] - box.cx) ** 2 + (points[j][1] - box.cy) ** 2)
+                    boxes_hit.add(i)
+                    points_hit.add(j)
+            rows.append(dict(frame=f"{name[:12]}:{frame}", depth_limit=f"{num(MAX_DEPTH_MM / 1000)} m" if limit else "ingen",
+                             marked=len(points), detections=len(boxes), recall=len(points_hit) / len(points),
+                             precision_lower_bound=len(boxes_hit) / max(len(boxes), 1), count_error=len(boxes) / len(points) - 1))
+    table = pd.DataFrame(rows).round(3)
+    table.to_csv(OUT / "marked_frames_eval.csv", index=False, encoding="utf-8-sig")
+    return table
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("recordings", nargs="*", type=Path)
-    ap.add_argument("--calibrate", action="store_true", help="fit the size scale on the tree-1 calibration recordings")
-    ap.add_argument("--evaluate", action="store_true", help="score the detector on the hand-marked frames")
-    ap.add_argument("--reuse", action="store_true", help="reuse detections.csv from an earlier run")
+    ap = argparse.ArgumentParser(description="Räkna äpplen och uppskatta skörden från RGB-D-inspelningar.")
+    ap.add_argument("recordings", nargs="*", type=Path, help="inspelningsmappar")
+    ap.add_argument("--calibrate", action="store_true", help="anpassa storleksskalan på träd 1-inspelningarna för kalibrering")
+    ap.add_argument("--evaluate", action="store_true", help="kontrollera detektorn på de handmarkerade bildrutorna")
+    ap.add_argument("--reuse", action="store_true", help="återanvänd detections.csv från en tidigare körning")
     args = ap.parse_args()
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     model = YOLO(WEIGHTS)
-    cal_path = OUT / "calibration" / "calibration.json"
-    cal = calibrate(model, args.reuse) if args.calibrate or not cal_path.exists() else json.loads(cal_path.read_text())
+    calibration_path = CALIBRATION_DIR / "calibration.json"
+    if args.calibrate or not calibration_path.exists():
+        calibration = calibrate(model, args.reuse)
+    else:
+        calibration = json.loads(calibration_path.read_text())
     if args.evaluate:
         print(evaluate_marked(model).to_string(index=False))
-    rows = []
-    for rec in args.recordings:
-        s = process(rec, model, cal, args.reuse)
-        print_summary(s)
-        rows.append(s)
-    if rows:
-        cols = ["recording", "tree", "count_2d_no_limit", "count_2d_with_limit", "count_3d_single_frame", "count_3d", "count_low", "count_high",
+    summaries = []
+    for recording in args.recordings:
+        summary = process(recording, model, calibration, args.reuse)
+        print_summary(summary)
+        summaries.append(summary)
+    if summaries:
+        cols = ["recording", "tree", "count_2d_no_limit", "count_2d_with_limit", "count_3d", "count_low", "count_high",
                 "fully_visible_apples", "median_diameter_mm", "mean_weight_g", "estimate_kg", "kg_low", "kg_high"]
-        pd.DataFrame(rows)[cols].round(1).to_csv(OUT / "comparison.csv", index=False)
+        # utf-8-sig så att Excel visar å, ä, ö rätt
+        pd.DataFrame(summaries)[cols].round(1).to_csv(OUT / "comparison.csv", index=False, encoding="utf-8-sig")
 
 
 if __name__ == "__main__":

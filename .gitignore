@@ -9,24 +9,27 @@
 # do not even walk into these (big, never needed)
 .venv/
 Archive/
+Development/
 __pycache__/
-Main/runs/detect/runs/ft3/
-Main/runs/detect/runs/ft5/
 
-# ---- needed to run
+# ---- needed to run (everything the working version uses lives in Main/)
 !.gitignore
 !CLAUDE.md
 !/README.md
-!Main/3d_annotated/README.md
 !INSTRUKTIONER.md
+!HOW_IT_WORKS.md
 !requirements.txt
-# the pipeline (pipeline_3d.py imports shared parts from pipeline.py)
-!Main/pipeline.py
+!Results/pipeline_3d/README.md
+# the pipeline, its drawing module and the OAK-D snapshot script
 !Main/pipeline_3d.py
-# fine-tuned apple detector the pipeline loads
-!Main/runs/detect/runs/apple_ft/weights/last.pt
-# OAK-D snapshots: script + run 2b detector (trained on Orbbec + OAK-D)
+!Main/visualize.py
 !Main/oak_d_snapshots.py
-!Main/runs/detect/runs/apple_ft_run2b/weights/last.pt
-# size calibration, so new recordings can be processed without re-calibrating on the tree-1 recordings
-!Main/3d_annotated/calibration/calibration.json
+# detectors: run 1 (Orbbec, used by pipeline_3d.py) and run 2b (OAK-D, used by oak_d_snapshots.py)
+!Main/models/apple_run1.pt
+!Main/models/apple_run2b.pt
+# size calibration (+ the calibration apples, the fallback when a recording has too few measurable apples)
+!Main/calibration/calibration.json
+!Main/calibration/fully_visible_apples.csv
+# hand-marked apples, for --evaluate
+!Main/annotations/*_points.csv
+CLAUDE.md

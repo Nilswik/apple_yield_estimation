@@ -30,7 +30,7 @@ cd Main
 python pipeline_3d.py ../Archive/test_images ../Archive/Tree2 ../Archive/1dceb275-6e92-4368-9df5-1526972df094
 ```
 
-This writes `Main/3d_annotated/<recording>/` with `annotated_3d.mp4`, `audit_numbered.mp4`, `final.png` and the numbers (`summary.json`, `comparison.csv`), and prints the summary. Expected:
+This writes `Results/pipeline_3d/<recording>/` with `annotated_3d.mp4`, `audit_numbered.mp4`, `final.png` and the numbers (`summary.json`, `comparison.csv`), and prints the summary (in Swedish). Expected:
 
 | Recording | Apples | Yield |
 |---|---|---|
@@ -38,7 +38,14 @@ This writes `Main/3d_annotated/<recording>/` with `annotated_3d.mp4`, `audit_num
 | Tree2 | 50 | 7.1 kg |
 | 1dceb275 | 43 | 5.5 kg |
 
-The repo contains the fine-tuned detector (`Main/runs/detect/runs/apple_ft/weights/last.pt`) and the size calibration (`Main/3d_annotated/calibration/calibration.json`), so nothing else is needed. Do not run `--calibrate` unless you want to redo the calibration; it overwrites `calibration.json`.
+The repo contains everything the run needs, all in `Main/`: the fine-tuned detector (`models/apple_run1.pt`), the size calibration (`calibration/`) and the hand-marked apples for `--evaluate` (`annotations/`). Do not run `--calibrate` unless you want to redo the calibration; it overwrites `calibration/calibration.json`.
+
+## Folders
+
+- `Main/`: only what the working version needs (`pipeline_3d.py` computes, `visualize.py` draws, `oak_d_snapshots.py` for OAK-D).
+- `Results/`: all outputs (`pipeline_3d/`, `oak_d/`, plus older runs). Not in the repo, except a README.
+- `Development/` (local, not in the repo): training data and scripts, all training runs, evaluation scripts, the old 2D pipeline and notes.
+- `HOW_IT_WORKS.md`: step-by-step explanation of the method.
 
 ## OAK-D snapshots (Luxonis)
 
@@ -49,4 +56,4 @@ cd Main
 python oak_d_snapshots.py C:/path/to/the/oak-d/folder
 ```
 
-This writes `OAK_D_RES/` in the repo root: one annotated image per capture (with its depth map), `overview.png`, `summary.csv` and `apples.csv`. It uses the run 2b detector (`Main/runs/detect/runs/apple_ft_run2b/weights/last.pt`), trained on both cameras. Counts are per capture; the captures overlap, so they must not be added up into a tree total.
+This writes `Results/oak_d/`: one annotated image per capture (with its depth map), `overview.png`, `summary.csv` and `apples.csv`. It uses the run 2b detector (`Main/models/apple_run2b.pt`), trained on both cameras. Counts are per capture; the captures overlap, so they must not be added up into a tree total.

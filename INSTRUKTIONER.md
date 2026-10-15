@@ -81,13 +81,13 @@ Det tar några minuter (längre utan grafikkort). När det är klart skrivs en s
 
 | Inspelning | Äpplen | Skörd |
 |---|---|---|
-| test_images | 100 | 11.6 kg |
-| Tree2 | 50 | 7.1 kg |
-| 1dceb275... | 43 | 5.5 kg |
+| test_images | 100 | 11,6 kg |
+| Tree2 | 50 | 7,1 kg |
+| 1dceb275... | 43 | 5,5 kg |
 
 ## Steg 6: Titta på resultaten
 
-Öppna mappen `C:\apple\Main\3d_annotated`. Där finns en mapp per inspelning med:
+Öppna mappen `C:\apple\Results\pipeline_3d`. Där finns en mapp per inspelning med:
 
 - **annotated_3d.mp4**: videon med alla äpplen markerade och sammanfattningen på slutet
 - **audit_numbered.mp4**: långsam video där varje räknat äpple har ett nummer, för att kontrollera räkningen
@@ -105,7 +105,7 @@ cd C:\apple\Main
 ..\.venv\Scripts\python oak_d_snapshots.py C:/oakd
 ```
 
-Resultaten hamnar i `C:\apple\OAK_D_RES`:
+Resultaten hamnar i `C:\apple\Results\oak_d`:
 - en bild per foto med äpplena markerade och djupbilden bredvid
 - **overview.png**: alla foton i en bild
 - **summary.csv**: antal äpplen och storlek per foto

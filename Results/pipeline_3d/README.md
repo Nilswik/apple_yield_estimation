@@ -1,6 +1,6 @@
 # 3D results (depth added)
 
-Made with `Main/pipeline_3d.py` on 2026-10-05. The 2D results in `Main/results_finetuned/` are kept for comparison; they were made before the counting bug fix described in `CLAUDE.md`.
+Made with `Main/pipeline_3d.py` on 2026-10-05. The 2D results in `Results/old_2d/results_finetuned/` are kept for comparison; they were made before the counting bug fix described in `CLAUDE.md`.
 
 ## What depth is used for
 
