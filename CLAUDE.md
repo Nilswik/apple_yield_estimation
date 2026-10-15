@@ -65,6 +65,7 @@ Commands: `python pipeline_3d.py --calibrate` (once), then `python pipeline_3d.p
 - Optional: add the 55% "clearly visible" rule (see Current results) as a second count in the summary and videos.
 - **New data coming from the stakeholder: Luxonis (OAK) camera.** Totally new hardware, a good generalisation test. Needs: intrinsics (fx, fy, cx, cy), color resolution, whether depth is aligned to color, depth unit, format/fps. Plan: write a converter into the `color/`, `depth/`, `meta.json` layout, run **untouched** first, mark one frame with dots for a hand count, then judge. The size scale will need re-checking for that camera.
 - Hand-count one full pass (two-frame method: dot frame 0 and the new part of the last frame), weigh about 10 apples (ideally the measured ones), label a few frames from other trees.
+- Future (developer convenience): PowerShell profile functions `apple <recording names...>` / `oakd <folder>` that Push-Location into `Main/`, run with `.venv\Scripts\python.exe` and map bare names to `../Archive/<name>` (keep paths relative because of the Ä/OpenCV issue). For the customer instead: drag-and-drop `.bat` files in the root that check `.venv` exists and open the results folder.
 - Camera setup idea for real use: higher, near-level mount instead of low and tilted at the sky; A/B comparison planned.
 
 ## Tools and environment

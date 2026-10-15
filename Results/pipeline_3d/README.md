@@ -26,7 +26,7 @@ Yield = apples counted x mean weight of that recording's fully visible apples.
 - Inside the view of each hand-marked frame, the count matches the hand count: 70 vs 68, 48 vs 45, 74-78 vs 76.
 - Double counting is rare: about 1 apple per pass, confirmed in the audit video. The camera-motion estimate agrees with optical flow within 2%.
 - The count includes partly hidden apples ("slivers") that a person does not count. Counting only apples with at least 55% of a whole apple's width visible (judged with depth) gives 81 / 46 / 39 and matches the hand-marked frames equally well. Not switched on yet.
-- `marked_frames_eval.csv`: the distance limit raises precision on the hand-marked frames by 1.5 - 2.7 points and costs at most one marked apple per frame.
+- `marked_frames_eval.csv` (`--evaluate`): recall and precision on the hand-marked frames. In the comparison made during development, the distance limit raised precision by 1.5 - 2.7 points and cost at most one marked apple per frame.
 
 Tried and dropped: a memory of where apples were seen over the whole pass, and optical-flow tracking of each apple. Both split apples into pieces (3-6 times too many). Remembering apples over +-2 frames worked technically but counted 16% more than people do.
 
@@ -35,8 +35,8 @@ Tried and dropped: a memory of where apples were seen over the whole pass, and o
 - The pass counts are not checked against a full hand count of a pass.
 - Everything depends on one weighed apple, assumed to come from tree 1 and to be of average size.
 - Tree 2 means come from only 6 - 8 fully visible apples, hence the wide ranges.
-- The ranges are plausible ranges, not statistical intervals.
+- The ranges are plausible ranges, not statistical intervals. Count range: lowest and highest of the 12 counting variants, widened by the 10% per-frame counting error. Weight range: 90% bootstrap over the fully visible apples and the size scale.
 
 ## Files per recording
 
-`annotated_3d.mp4` (ends with the summary), `audit_numbered.mp4` + `audit_apples.csv` (every counted apple numbered, frame held still, for checking by eye), `final.png`, `measured_apples.png` (the apples used for the weight), `apples_measured.csv`, `counts.csv` (all counting variants), `detections.csv`, `summary.json`. `comparison.csv` collects the numbers for all three recordings.
+`annotated_3d.mp4` (ends with the summary), `audit_numbered.mp4` + `audit_apples.csv` (every counted apple numbered, frame held still, for checking by eye), `final.png`, `measured_apples.png` (the apples used for the weight), `apples_measured.csv`, `counts.csv` (the 12 counting variants), `detections.csv`, `summary.json`. `comparison.csv` collects the numbers for all three recordings.
